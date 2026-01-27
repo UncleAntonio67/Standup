@@ -1,43 +1,56 @@
-# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
-
-# dependencies
+# --- Dependencies (依赖) ---
 node_modules/
+.pnpm-store/
 
-# Expo
+# --- Expo & React Native (Expo 特定缓存与构建) ---
 .expo/
-dist/
 web-build/
-expo-env.d.ts
+dist/
+.metro-health-check
 
-# Native
-.kotlin/
-*.orig.*
-*.jks
-*.p8
-*.p12
-*.key
-*.mobileprovision
+# --- IDE & Editor (IDE 配置 - 针对你的截图环境) ---
+# JetBrains (WebStorm/IntelliJ)
+.idea/
+*.iml
+# VS Code (以防万一团队其他人使用)
+.vscode/
+*.swp
+*.swo
 
-# Metro
-.metro-health-check*
+# --- Testing & Debug (调试日志) ---
+coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
-# debug
-npm-debug.*
-yarn-debug.*
-yarn-error.*
-
-# macOS
-.DS_Store
+# --- Environment & Security (环境配置与密钥 - 绝对不要提交) ---
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 *.pem
+*.key
+*.keystore
 
-# local env files
-.env*.local
+# --- OS Files (操作系统生成的垃圾文件) ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Desktop.ini
 
-# typescript
-*.tsbuildinfo
+# --- Typescript (TS 编译产物 - 如果有的话) ---
+# 通常 Expo 项目不需要忽略 .js，除非你手动运行了 tsc 输出到同级目录
+# *.js.map
 
-app-example
-
-# generated native folders
-/ios
-/android
+# --- Native Build Generated (如果之后你运行了 prebuild 生成了原生目录) ---
+android/app/build/
+android/.gradle/
+ios/Pods/
+ios/build/
+*.xcworkspace
+!ios/*.xcworkspace # 保留根目录的 workspace，忽略内部生成的
