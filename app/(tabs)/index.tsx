@@ -1,589 +1,967 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, StatusBar, Modal, TextInput, Platform, ScrollView, Animated, FlatList } from 'react-native';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Alert, Modal, Pressable, ScrollView, StyleSheet, Text, TouchableOpacity, View, useWindowDimensions } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Audio } from 'expo-av';
-import BodyHighlighter from 'react-native-body-highlighter';
-import * as Notifications from 'expo-notifications';
-import { EXERCISE_DATA, Exercise } from '../../constants/data';
-import { useStorage, BodyPartSlug } from '../../hooks/useStorage';
+import * as Haptics from 'expo-haptics';
+import * as Speech from 'expo-speech';
+import Body, { ExtendedBodyPart, Slug } from 'react-native-body-highlighter';
+import Svg, { Circle } from 'react-native-svg';
+import { useRouter } from 'expo-router';
 
-const TRANSLATIONS = {
-  zh: {
-    brand: "BIOMECH GUARD",
-    subtitle: "机能监控在线",
-    settings: "控制台",
-    heatmapTitle: "肌群激活状态",
-    rotate: "切换视角",
-    timerTitle: "久坐计时",
-    sitting: "静止时间",
-    alarm: "超负荷警告",
-    stands: "今日起立",
-    target: "目标",
-    missionNext: "推荐任务",
-    missionAlarm: "立即执行",
-    missionDone: "我已完成",
-    missionStop: "停止报警 & 打卡",
-    progress: "进度",
-    modalTitle: "系统控制台",
-    limitLabel: "久坐阈值 (分钟)",
-    targetLabel: "每日部位目标 (次)",
-    btnCancel: "取消",
-    btnSave: "保存配置",
-    parts: { neck: "颈部", shoulder: "肩部", "lower-back": "腰背", core: "核心", gluteal: "臀部", leg: "腿部" },
-    tips: { tip: "战术提示" },
-    muscleModal: { title: "机能诊断报告", count: "分类总进度", actions: "推荐方案", empty: "暂无针对此部位的特定动作" }
-  },
-  en: {
-    brand: "BIOMECH GUARD",
-    subtitle: "SYSTEM ONLINE",
-    settings: "CONSOLE",
-    heatmapTitle: "MUSCLE STATUS",
-    rotate: "ROTATE VIEW",
-    timerTitle: "SESSION TIMER",
-    sitting: "SITTING TIME",
-    alarm: "CRITICAL OVERLOAD",
-    stands: "STANDS",
-    target: "TARGET",
-    missionNext: "NEXT PROTOCOL",
-    missionAlarm: "IMMINENT THREAT",
-    missionDone: "EXECUTE PROTOCOL",
-    missionStop: "DISENGAGE & LOG",
-    progress: "PROGRESS",
-    modalTitle: "SYSTEM CONSOLE",
-    limitLabel: "SITTING LIMIT (MIN)",
-    targetLabel: "DAILY TARGETS (REPS)",
-    btnCancel: "CANCEL",
-    btnSave: "SAVE CHANGES",
-    parts: { neck: "NECK", shoulder: "SHLDR", "lower-back": "BACK", core: "CORE", gluteal: "GLUTE", leg: "LEGS" },
-    tips: { tip: "TACTICAL TIP" },
-    muscleModal: { title: "DIAGNOSTIC REPORT", count: "CATEGORY PROGRESS", actions: "RECOMMENDED PROTOCOLS", empty: "No specific protocols for this sector." }
-  }
+import { TimerWidget } from '../../components/TimerWidget';
+import { CartoonActionPanel } from '../../components/CartoonActionPanel';
+import { APP_THEME } from '../../constants/app-theme';
+import { EXERCISE_DATA } from '../../constants/data';
+import { buildExerciseVoiceText, buildGuideVoiceText } from '../../constants/exercise-media';
+import { buildExerciseFrames, buildGuideFrames, getExerciseVisualPart, getGuideVisualPart } from '../../constants/exercise-visuals';
+import { PART_TRAINING_GUIDES, SEDENTARY_RECOVERY_GUIDES, TrainingGuide } from '../../constants/part-guides';
+import { PART_META, PART_ORDER } from '../../constants/part-meta';
+import { BodyPartSlug, HomeLayoutSectionId, WeekdayKey, getWeekdayKey, useStorage } from '../../hooks/useStorage';
+
+type PartProgress = {
+  slug: BodyPartSlug;
+  done: number;
+  target: number;
+  ratio: number;
+  remain: number;
+  status: 'todo' | 'partial' | 'done';
 };
 
-const THEME = {
-  bg: '#050a10',
-  cardBg: 'rgba(21, 32, 48, 0.9)',
-  primary: '#00f3ff',    // 进行中 (青色)
-  completed: '#39ff14',  // 已达标 (荧光绿)
-  primaryDim: 'rgba(0, 243, 255, 0.15)',
-  danger: '#ff2a2a',
-  text: '#ffffff',
-  textDim: '#8b9bb4',
-  border: 'rgba(0, 243, 255, 0.3)',
+type PartNudge = {
+  slug: BodyPartSlug;
+  score: number;
+  reason: string;
+  level: 'soft' | 'confirm';
+  at: number;
 };
 
-if (Platform.OS !== 'web') {
-  Notifications.setNotificationHandler({
-    handleNotification: async () => ({ shouldShowAlert: true, shouldPlaySound: true, shouldSetBadge: false } as any),
-  });
-}
+type ReminderExercise = (typeof EXERCISE_DATA)[number];
 
-// [核心修复] 肌肉 -> 大类指标 映射表
-// 确保人体图上的每一个色块都能找到对应的 KPI
-const MUSCLE_MAP: Record<string, BodyPartSlug> = {
-  // 颈部
-  'neck': 'neck',
-  'sternocleidomastoid': 'neck',
-  'trapezius': 'neck', // 斜方肌上束归为颈部压力
-  // 肩部
-  'deltoids': 'shoulder',
-  'pectorals': 'shoulder', // 胸肌紧会导致圆肩，归为肩部管理
-  // 腰背
-  'upper-back': 'lower-back', // 简化处理，统称背部
+const DAY_LABEL: Record<WeekdayKey, string> = {
+  mon: '周一',
+  tue: '周二',
+  wed: '周三',
+  thu: '周四',
+  fri: '周五',
+  sat: '周六',
+  sun: '周日',
+};
+
+const BODY_TO_TARGET: Partial<Record<Slug, BodyPartSlug>> = {
+  neck: 'neck',
+  trapezius: 'shoulder',
+  deltoids: 'shoulder',
+  triceps: 'shoulder',
   'lower-back': 'lower-back',
-  // 核心
-  'rectus-abdominis': 'core',
-  'obliques': 'core',
-  // 臀部
-  'gluteal': 'gluteal',
-  'abductors': 'gluteal',
-  // 腿部
-  'hamstring': 'leg',
-  'quadriceps': 'leg',
-  'calves': 'leg',
-  'tibialis': 'leg'
+  abs: 'core',
+  obliques: 'core',
+  gluteal: 'gluteal',
+  quadriceps: 'leg',
+  hamstring: 'leg',
+  calves: 'leg',
+  tibialis: 'leg',
+  knees: 'leg',
 };
 
-const ProgressBar = ({ label, current, target }: { label: string, current: number, target: number }) => {
-  const isCompleted = current >= target;
-  const progress = Math.min(current / target, 1) * 100;
-  const color = isCompleted ? THEME.completed : THEME.primary;
+const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
+
+function ProgressRing({
+  progress,
+  size,
+  stroke,
+  color,
+  track,
+}: {
+  progress: number;
+  size: number;
+  stroke: number;
+  color: string;
+  track: string;
+}) {
+  const safe = clamp(progress, 0, 1);
+  const r = (size - stroke) / 2;
+  const c = 2 * Math.PI * r;
+  const offset = c * (1 - safe);
 
   return (
-      <View style={styles.progressRow}>
-        <View style={styles.progressLabelBox}>
-          <Text style={styles.progressLabel}>{label}</Text>
-          <Text style={[styles.progressValue, { color: color }]}>{current}/{target}</Text>
-        </View>
-        <View style={styles.track}>
-          <View style={[styles.fill, { width: `${progress}%`, backgroundColor: color }]} />
-        </View>
-      </View>
+    <Svg width={size} height={size}>
+      <Circle cx={size / 2} cy={size / 2} r={r} stroke={track} strokeWidth={stroke} fill="none" />
+      <Circle
+        cx={size / 2}
+        cy={size / 2}
+        r={r}
+        stroke={color}
+        strokeWidth={stroke}
+        fill="none"
+        strokeDasharray={`${c} ${c}`}
+        strokeDashoffset={offset}
+        strokeLinecap="round"
+        transform={`rotate(-90 ${size / 2} ${size / 2})`}
+      />
+    </Svg>
   );
-};
+}
 
-export default function Dashboard() {
-  const { settings, saveSettings, isSosMode, muscleProgress, finishExercise, lang, toggleLang } = useStorage();
-  const t = TRANSLATIONS[lang];
+export default function HomeScreen() {
+  const {
+    settings,
+    todayActivity,
+    muscleProgress,
+    finishExercise,
+    completeSedentaryBreak,
+    themeMode,
+    toggleThemeMode,
+    lang,
+    homeLayoutOrder,
+  } = useStorage();
+  const router = useRouter();
+  const { width } = useWindowDimensions();
 
-  const [seconds, setSeconds] = useState(0);
-  const [isAlarm, setIsAlarm] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
-  const [showMuscleModal, setShowMuscleModal] = useState(false);
-  const [bodySide, setBodySide] = useState<'front' | 'back'>('back');
-  const [selectedMuscle, setSelectedMuscle] = useState<{slug: string, name: string} | null>(null);
-  const [formLimit, setFormLimit] = useState('');
-  const [formTargets, setFormTargets] = useState<Record<string, string>>({});
+  const theme = APP_THEME[themeMode];
+  const isWide = width >= 980;
 
-  const soundRef = useRef<Audio.Sound | null>(null);
-  const pulseAnim = useRef(new Animated.Value(0)).current;
+  const [sitSeconds, setSitSeconds] = useState(0);
+  const [showSedentaryModal, setShowSedentaryModal] = useState(false);
+  const [showPartReminderModal, setShowPartReminderModal] = useState(false);
+  const [showGuideModal, setShowGuideModal] = useState(false);
+  const [selectedPart, setSelectedPart] = useState<BodyPartSlug | null>(null);
+  const [selectedExercise, setSelectedExercise] = useState<ReminderExercise | null>(null);
+  const [selectedRecoveryGuide, setSelectedRecoveryGuide] = useState<TrainingGuide | null>(null);
+  const [bodySide, setBodySide] = useState<'front' | 'back'>('front');
+  const [partNudge, setPartNudge] = useState<PartNudge | null>(null);
 
-  // 1. 任务推荐
-  const currentMission = useMemo(() => {
-    const parts: BodyPartSlug[] = ['neck', 'shoulder', 'lower-back', 'core', 'gluteal', 'leg'];
-    const sortedParts = parts.sort((a, b) => {
-      const rateA = (muscleProgress[a] || 0) / (settings.targets[a] || 1);
-      const rateB = (muscleProgress[b] || 0) / (settings.targets[b] || 1);
-      return rateA - rateB;
-    });
-    const targetPart = sortedParts[0];
-    const availableExercises = EXERCISE_DATA.filter(ex =>
-        ex.targetSlug === targetPart && (!isSosMode || ex.isSosSafe)
-    );
-    return availableExercises[Math.floor(Math.random() * availableExercises.length)] || availableExercises[0];
-  }, [muscleProgress, settings.targets, isSosMode]);
+  const lastPartReminderAtRef = useRef(0);
+  const partSnoozeUntilRef = useRef(0);
+  const partMuteDateRef = useRef<string | null>(null);
+  const partIgnoreCountRef = useRef(0);
+  const partCompleteCountRef = useRef(0);
 
-  // 2. [核心修复] 热力图逻辑：颜色与总指标严格同步
-  const heatmapData = useMemo(() => {
-    const map: any = [];
-
-    // 遍历所有已定义的肌肉映射
-    Object.keys(MUSCLE_MAP).forEach(muscleSlug => {
-      const targetSlug = MUSCLE_MAP[muscleSlug];
-
-      // 获取该大类（如颈部）的总进度
-      const categoryTotal = muscleProgress[targetSlug] || 0;
-      const categoryTarget = settings.targets[targetSlug] || 5;
-
-      // 只要该大类有开始练 (>0)，相关的所有肌肉都应该亮起来
-      if (categoryTotal > 0) {
-        const isCompleted = categoryTotal >= categoryTarget;
-
-        map.push({
-          slug: muscleSlug,
-          // 颜色：大类达标即全绿
-          color: isCompleted ? THEME.completed : THEME.primary,
-          // 亮度：未达标时随进度增加，达标后最亮
-          intensity: isCompleted ? 1 : Math.max(0.4, Math.min(categoryTotal / categoryTarget, 0.9))
-        });
-      }
-    });
-    return map;
-  }, [muscleProgress, settings.targets]);
-
-  const selectedMuscleExercises = useMemo(() => {
-    if (!selectedMuscle) return [];
-    // 弹窗里的推荐动作：根据点击肌肉所属的大类来推荐，而不是仅限于该肌肉
-    const target = MUSCLE_MAP[selectedMuscle.slug];
-    if (target) {
-      return EXERCISE_DATA.filter(ex => ex.targetSlug === target);
-    }
-    return EXERCISE_DATA.filter(ex => ex.bodyPartSlug.includes(selectedMuscle.slug));
-  }, [selectedMuscle]);
-
-  const limitSec = (settings.limitMin || 45) * 60;
+  const todayKey = getWeekdayKey();
+  const effectivePlan = settings.useDailyPlan ? settings.dailyPlans[todayKey] : { limitMin: settings.limitMin, targets: settings.targets };
 
   useEffect(() => {
-    if (isAlarm) {
-      Animated.loop(
-          Animated.sequence([
-            Animated.timing(pulseAnim, { toValue: 1, duration: 800, useNativeDriver: false }),
-            Animated.timing(pulseAnim, { toValue: 0, duration: 800, useNativeDriver: false }),
-          ])
-      ).start();
-    } else {
-      pulseAnim.setValue(0);
-      pulseAnim.stopAnimation();
-    }
-  }, [isAlarm]);
+    const timer = setInterval(() => setSitSeconds((s) => s + 1), 1000);
+    return () => clearInterval(timer);
+  }, []);
 
-  const backgroundColor = pulseAnim.interpolate({
-    inputRange: [0, 1],
-    outputRange: [THEME.bg, '#310a0a']
-  });
+  const sitLimitSeconds = useMemo(() => Math.max(1, effectivePlan.limitMin) * 60, [effectivePlan.limitMin]);
+  const sedentaryAlarmOn = sitSeconds >= sitLimitSeconds;
+
+  const pingByLevel = useCallback(async () => {
+    if (settings.alertLevel === 'critical') {
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      return;
+    }
+    if (settings.alertLevel === 'high') {
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+      return;
+    }
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  }, [settings.alertLevel]);
+
+  useEffect(() => {
+    if (!sedentaryAlarmOn) return;
+
+    const guide = SEDENTARY_RECOVERY_GUIDES[Math.floor(Math.random() * SEDENTARY_RECOVERY_GUIDES.length)];
+    setSelectedRecoveryGuide(guide);
+    setShowSedentaryModal(true);
+    void pingByLevel();
+
+    if (settings.alertLevel === 'normal') return;
+    const ms = settings.alertLevel === 'critical' ? 4500 : 10000;
+    const timer = setInterval(() => {
+      void pingByLevel();
+    }, ms);
+    return () => clearInterval(timer);
+  }, [pingByLevel, sedentaryAlarmOn, settings.alertLevel]);
+
+  const isInWorkWindow = useCallback(() => {
+    if (!settings.remindersInWorkOnly) return true;
+
+    const now = new Date().getHours();
+    const start = clamp(settings.workStartHour, 0, 23);
+    const end = clamp(settings.workEndHour, 0, 23);
+
+    if (start === end) return true;
+    if (start < end) return now >= start && now < end;
+    return now >= start || now < end;
+  }, [settings.remindersInWorkOnly, settings.workStartHour, settings.workEndHour]);
+
+  const partProgress = useMemo<PartProgress[]>(() => {
+    return PART_ORDER.map((slug) => {
+      const done = muscleProgress[slug] || 0;
+      const target = Math.max(1, effectivePlan.targets[slug] || 1);
+      const ratio = done / target;
+      const remain = Math.max(target - done, 0);
+      return {
+        slug,
+        done,
+        target,
+        ratio,
+        remain,
+        status: ratio >= 1 ? 'done' : ratio > 0 ? 'partial' : 'todo',
+      };
+    });
+  }, [effectivePlan.targets, muscleProgress]);
+
+  const nextRecommended = useMemo(() => {
+    return partProgress
+      .filter((item) => item.remain > 0)
+      .sort((a, b) => {
+        if (b.remain !== a.remain) return b.remain - a.remain;
+        return a.ratio - b.ratio;
+      })[0];
+  }, [partProgress]);
+
+  const getPartExercises = useCallback((slug: BodyPartSlug) => {
+    return EXERCISE_DATA.filter((item) => item.targetSlug === slug).slice(0, 6);
+  }, []);
+
+  const openPartReminder = useCallback(
+    (slug: BodyPartSlug) => {
+      const pool = getPartExercises(slug);
+      setSelectedPart(slug);
+      setSelectedExercise(pool.length ? pool[Math.floor(Math.random() * pool.length)] : null);
+      setShowPartReminderModal(true);
+    },
+    [getPartExercises]
+  );
+
+  const shouldMutePartNudgeToday = useCallback(() => {
+    return partMuteDateRef.current === new Date().toISOString().slice(0, 10);
+  }, []);
+
+  const buildPartNudge = useCallback((): PartNudge | null => {
+    if (!nextRecommended) return null;
+
+    const now = Date.now();
+    if (now < partSnoozeUntilRef.current) return null;
+    if (shouldMutePartNudgeToday()) return null;
+
+    const hour = new Date().getHours();
+    const profileFactor =
+      settings.partNudgeProfile === 'active' ? 1.2 : settings.partNudgeProfile === 'gentle' ? 0.88 : 1;
+    const weightedBase =
+      (Math.max(0, nextRecommended.remain) * 14 + Math.max(0, 1 - nextRecommended.ratio) * 50) * profileFactor;
+    const weightedUrgency = hour >= 17 ? 20 : hour >= 15 ? 14 : hour >= 12 ? 8 : 0;
+    const weightedFatiguePenalty = Math.min(partIgnoreCountRef.current * 12, 30);
+    const weightedStreakBoost = Math.min(partCompleteCountRef.current * 3, 9);
+    const weightedScore = Math.max(
+      0,
+      Math.round(weightedBase + weightedUrgency - weightedFatiguePenalty + weightedStreakBoost)
+    );
+
+    if (weightedScore < settings.partNudgeSoftThreshold) {
+      return null;
+    }
+
+    const weightedLevel: PartNudge['level'] = weightedScore >= settings.partNudgeConfirmThreshold ? 'confirm' : 'soft';
+    const weightedReason =
+      weightedLevel === 'confirm'
+        ? `该部位今天还差 ${nextRecommended.remain} 次，建议现在完成 1 次。`
+        : `轻提醒：该部位还差 ${nextRecommended.remain} 次，可在空档完成。`;
+
+    return {
+      slug: nextRecommended.slug,
+      score: weightedScore,
+      reason: weightedReason,
+      level: weightedLevel,
+      at: now,
+    };
+  }, [
+    nextRecommended,
+    settings.partNudgeConfirmThreshold,
+    settings.partNudgeProfile,
+    settings.partNudgeSoftThreshold,
+    shouldMutePartNudgeToday,
+  ]);
 
   useEffect(() => {
     const timer = setInterval(() => {
-      setSeconds(s => {
-        const next = s + 1;
-        if (next >= limitSec && !isAlarm) triggerAlarm();
-        return next;
-      });
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [limitSec, isAlarm]);
+      if (sedentaryAlarmOn) return;
+      if (!isInWorkWindow()) return;
 
-  const triggerAlarm = async () => {
-    setIsAlarm(true);
-    try {
-      const { sound } = await Audio.Sound.createAsync(
-          { uri: 'https://cdn.freesound.org/previews/337/337049_3232293-lq.mp3' } as any,
-          { shouldPlay: true, isLooping: true } as any
-      );
-      soundRef.current = sound;
-      await sound.playAsync();
-    } catch(e) {}
+      const intervalMs = Math.max(1, settings.partReminderMin) * 60 * 1000;
+      if (Date.now() - lastPartReminderAtRef.current < intervalMs) return;
 
-    if (Platform.OS === 'web') {
-      if ("Notification" in window && Notification.permission === "granted") {
-        new Notification(t.alarm, { body: t.missionAlarm });
+      const nudge = buildPartNudge();
+      if (!nudge) return;
+
+      lastPartReminderAtRef.current = Date.now();
+      if (nudge.level === 'confirm') {
+        openPartReminder(nudge.slug);
+        setPartNudge(null);
+        return;
       }
-      return;
+
+      setPartNudge(nudge);
+    }, 15000);
+
+    return () => clearInterval(timer);
+  }, [buildPartNudge, isInWorkWindow, openPartReminder, sedentaryAlarmOn, settings.partReminderMin]);
+
+  const highlights = useMemo<ExtendedBodyPart[]>(() => {
+    const map = new Map<Slug, 1 | 2>();
+
+    partProgress.forEach((item) => {
+      if (item.status === 'todo') return;
+      const intensity: 1 | 2 = item.status === 'done' ? 2 : 1;
+
+      PART_META[item.slug].bodySlugs.forEach((bodySlug) => {
+        const current = map.get(bodySlug);
+        if (!current || intensity > current) map.set(bodySlug, intensity);
+      });
+    });
+
+    return Array.from(map.entries()).map(([slug, intensity]) => ({ slug, intensity }));
+  }, [partProgress]);
+
+  const selectedExercises = useMemo(() => {
+    if (!selectedPart) return [];
+    const fromData = getPartExercises(selectedPart);
+    const fromGuides = PART_TRAINING_GUIDES[selectedPart] || [];
+
+    const transformed = fromGuides.map((guide) => ({
+      id: guide.id,
+      title: guide.title,
+      desc: `${guide.goal} · ${guide.duration}`,
+      tip: guide.cue,
+      titleEn: '',
+      descEn: '',
+      tipEn: '',
+      posture: 'standing' as const,
+      isSosSafe: true,
+      bodyPartSlug: [selectedPart],
+      targetSlug: selectedPart,
+    }));
+
+    return [...fromData, ...transformed].slice(0, 8);
+  }, [getPartExercises, selectedPart]);
+
+  const panelColors = useMemo(
+    () => ({
+      surface: theme.surfaceAlt,
+      border: theme.border,
+      text: theme.text,
+      textDim: theme.textDim,
+      primary: theme.primary,
+    }),
+    [theme.border, theme.primary, theme.surfaceAlt, theme.text, theme.textDim]
+  );
+
+  const completeSedentary = useCallback(async () => {
+    await completeSedentaryBreak(sitSeconds);
+    setSitSeconds(0);
+    setShowSedentaryModal(false);
+  }, [completeSedentaryBreak, sitSeconds]);
+
+  const completePart = useCallback(async () => {
+    if (!selectedPart) return;
+
+    if (selectedExercise) {
+      await finishExercise(selectedExercise.bodyPartSlug, selectedExercise.targetSlug);
+    } else {
+      await finishExercise([selectedPart], selectedPart);
     }
-    await Notifications.scheduleNotificationAsync({
-      content: { title: t.alarm, body: t.missionAlarm, sound: true },
-      trigger: null,
-    });
-  };
 
-  const handleMusclePress = (muscle: { slug: string, name: string }) => {
-    setSelectedMuscle(muscle);
-    setShowMuscleModal(true);
-  };
+    setShowPartReminderModal(false);
+    setPartNudge(null);
+    partIgnoreCountRef.current = Math.max(0, partIgnoreCountRef.current - 1);
+    partCompleteCountRef.current += 1;
+    Alert.alert('完成', `${PART_META[selectedPart].label} +1`);
+  }, [finishExercise, selectedExercise, selectedPart]);
 
-  const handleQuickComplete = (exercise: Exercise) => {
-    finishExercise(exercise.bodyPartSlug, exercise.targetSlug);
-    setShowMuscleModal(false);
-  };
+  const previewSedentary = useCallback(() => {
+    const guide = SEDENTARY_RECOVERY_GUIDES[Math.floor(Math.random() * SEDENTARY_RECOVERY_GUIDES.length)];
+    setSelectedRecoveryGuide(guide);
+    setShowSedentaryModal(true);
+    void pingByLevel();
+  }, [pingByLevel]);
 
-  const handleCompleteMission = () => {
-    setIsAlarm(false);
-    setSeconds(0);
-    if (soundRef.current) (soundRef.current as any).stopAsync?.();
-    if (currentMission) {
-      finishExercise(currentMission.bodyPartSlug, currentMission.targetSlug);
+  const previewPartReminder = useCallback(() => {
+    const next = nextRecommended?.slug || 'neck';
+    openPartReminder(next);
+  }, [nextRecommended?.slug, openPartReminder]);
+
+  const remindPartNow = useCallback(() => {
+    const slug = partNudge?.slug || nextRecommended?.slug;
+    if (!slug) return;
+    setPartNudge(null);
+    openPartReminder(slug);
+  }, [nextRecommended?.slug, openPartReminder, partNudge?.slug]);
+
+  const snoozePartReminder = useCallback(() => {
+    partSnoozeUntilRef.current = Date.now() + 10 * 60 * 1000;
+    partIgnoreCountRef.current += 1;
+    setPartNudge(null);
+  }, []);
+
+  const mutePartReminderToday = useCallback(() => {
+    partMuteDateRef.current = new Date().toISOString().slice(0, 10);
+    partIgnoreCountRef.current += 2;
+    setPartNudge(null);
+  }, []);
+
+  const onBodyPress = useCallback((item: ExtendedBodyPart) => {
+    if (!item.slug) return;
+    const mapped = BODY_TO_TARGET[item.slug];
+    if (!mapped) return;
+    setSelectedPart(mapped);
+    setShowGuideModal(true);
+  }, []);
+
+  const speakText = useCallback(
+    (text: string) => {
+      Speech.stop();
+      Speech.speak(text, {
+        language: lang === 'zh' ? 'zh-CN' : 'en-US',
+        rate: 0.95,
+        pitch: 1,
+      });
+    },
+    [lang]
+  );
+
+  const mm = String(Math.floor(sitSeconds / 60)).padStart(2, '0');
+  const ss = String(sitSeconds % 60).padStart(2, '0');
+  const totalSitMinToday = Math.round((todayActivity.sitSeconds || 0) / 60);
+
+  const workspaceInsight = useMemo(() => {
+    const hour = new Date().getHours();
+    const segment = hour < 11 ? '上午专注' : hour < 14 ? '午间过渡' : hour < 18 ? '下午专注' : '下班恢复';
+
+    const avgProgress =
+      partProgress.reduce((sum, item) => sum + Math.min(item.done / item.target, 1), 0) /
+      Math.max(1, partProgress.length);
+
+    const issues: string[] = [];
+    const suggestions: string[] = [];
+
+    if (sitSeconds > sitLimitSeconds * 0.8) {
+      issues.push('本轮久坐接近阈值，颈腰负担明显增加。');
+      suggestions.push('建议马上执行 1 分钟站立 + 2 轮踝泵。');
     }
-  };
+    if ((todayActivity.sedentaryBreaks || 0) < 2 && hour >= 15) {
+      issues.push('下午久坐打断次数偏少，易出现专注下降。');
+      suggestions.push('把部位提醒间隔调整到 3~4 分钟。');
+    }
+    if (avgProgress < 0.4) {
+      issues.push('部位训练完成度较低，刺激分配不均衡。');
+      suggestions.push('优先完成“下一优先部位”，再补核心/腿部。');
+    }
+    if (!issues.length) {
+      issues.push('当前节奏较稳定，但仍需防止长时间静坐。');
+      suggestions.push('每 45~60 分钟至少离座活动一次。');
+    }
 
-  const openSettings = () => {
-    setFormLimit(settings.limitMin.toString());
-    const newTargets: any = {};
-    Object.keys(settings.targets).forEach(key => {
-      newTargets[key] = settings.targets[key as BodyPartSlug].toString();
-    });
-    setFormTargets(newTargets);
-    setShowSettings(true);
-  };
+    return {
+      segment,
+      issues,
+      suggestions,
+    };
+  }, [partProgress, sitLimitSeconds, sitSeconds, todayActivity.sedentaryBreaks]);
 
-  const handleSaveSettings = () => {
-    const parsedTargets: any = {};
-    Object.keys(formTargets).forEach(key => {
-      parsedTargets[key] = parseInt(formTargets[key]) || 3;
-    });
-    saveSettings({
-      limitMin: parseInt(formLimit) || 45,
-      targets: parsedTargets
-    });
-    setShowSettings(false);
-  };
+  const orderedSectionIds = useMemo<HomeLayoutSectionId[]>(() => {
+    const source = homeLayoutOrder?.length ? homeLayoutOrder : ['sedentary', 'part', 'summary', 'overview', 'settings', 'insight'];
+    const normalized = source.map((item) => {
+      if (item === 'part') return 'partReminder';
+      if (item === 'overview') return 'bodyOverview';
+      if (item === 'settings') return 'quickActions';
+      if (item === 'insight') return 'workspaceInsight';
+      return item;
+    }) as HomeLayoutSectionId[];
 
-  const formatTime = (sec: number) => {
-    const m = Math.floor(sec / 60).toString().padStart(2, '0');
-    const s = (sec % 60).toString().padStart(2, '0');
-    return { m, s };
-  };
-  const timeDisplay = formatTime(seconds);
+    const merged = [...normalized];
+    (['sedentary', 'partReminder', 'summary', 'bodyOverview', 'quickActions', 'workspaceInsight'] as HomeLayoutSectionId[]).forEach(
+      (id) => {
+        if (!merged.includes(id)) merged.push(id);
+      }
+    );
+    return merged;
+  }, [homeLayoutOrder]);
 
-  const partColors: Record<string, string> = {
-    neck: '#00d4ff', shoulder: '#00d4ff', 'lower-back': '#00d4ff',
-    core: '#00d4ff', gluteal: '#00d4ff', leg: '#00d4ff'
-  };
-
-  return (
-      <Animated.View style={[styles.container, { backgroundColor: backgroundColor as any }]}>
-        <SafeAreaView style={{flex: 1}}>
-          <StatusBar barStyle="light-content" />
-
-          {/* Header */}
-          <View style={styles.header}>
-            <View>
-              <Text style={styles.brand}>{t.brand}</Text>
-              <Text style={styles.brandSub}>{t.subtitle}</Text>
-            </View>
-            <View style={{flexDirection: 'row', gap: 10}}>
-              <TouchableOpacity onPress={toggleLang} style={styles.langBtn}>
-                <Text style={styles.btnTextSmall}>{lang === 'zh' ? 'EN' : 'CN'}</Text>
-              </TouchableOpacity>
-              <TouchableOpacity onPress={openSettings} style={styles.settingBtn}>
-                <Text style={styles.btnTextSmall}>{t.settings}</Text>
-              </TouchableOpacity>
-            </View>
+  const renderSectionById = (sectionId: HomeLayoutSectionId) => {
+    if (sectionId === 'sedentary') {
+      return (
+        <View style={[styles.card, styles.gradientCard, { borderColor: sedentaryAlarmOn ? theme.danger : theme.border }]}> 
+          <View style={styles.cardTitleRow}>
+            <Text style={[styles.cardTitle, { color: theme.text }]}>久坐提醒（最高优先级）</Text>
+            <Text style={[styles.priorityText, { color: theme.danger }]}>PRIORITY</Text>
           </View>
 
-          <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
+          <TimerWidget
+            styles={styles}
+            title="本轮久坐时长"
+            minutes={mm}
+            seconds={ss}
+            status={sedentaryAlarmOn ? '请立即起立活动，点击完成' : `今日阈值：${effectivePlan.limitMin} 分钟`}
+            isAlarm={sedentaryAlarmOn}
+            dangerColor={theme.danger}
+            titleColor={theme.textDim}
+            timeColor={theme.text}
+            dimColor={theme.textDim}
+            cardStyle={{ backgroundColor: theme.surfaceAlt, borderColor: theme.border }}
+          />
 
-            <View style={styles.dashboardRow}>
-              {/* Heatmap Area */}
-              <View style={styles.heatmapCard}>
-                <View style={styles.cardHeader}>
-                  <Text style={styles.cardLabel}>{t.heatmapTitle}</Text>
-                  <TouchableOpacity onPress={() => setBodySide(prev => prev === 'front' ? 'back' : 'front')} style={styles.rotateBtn}>
-                    <Text style={styles.rotateText}>↻ {t.rotate}</Text>
-                  </TouchableOpacity>
-                </View>
-
-                <View style={styles.heatmapWrapper}>
-                  <BodyHighlighter
-                      data={heatmapData}
-                      side={bodySide}
-                      scale={1.35}
-                      onMusclePress={handleMusclePress}
-                  />
-                </View>
-
-                <View style={styles.legendContainer}>
-                  <View style={{flexDirection:'row', alignItems:'center', gap:4}}>
-                    <View style={{width:8, height:8, backgroundColor: THEME.primary, borderRadius:4}}/>
-                    <Text style={{color: THEME.textDim, fontSize:9}}>Working</Text>
-                  </View>
-                  <View style={{flexDirection:'row', alignItems:'center', gap:4}}>
-                    <View style={{width:8, height:8, backgroundColor: THEME.completed, borderRadius:4}}/>
-                    <Text style={{color: THEME.textDim, fontSize:9}}>Target Met</Text>
-                  </View>
-                </View>
-              </View>
-
-              {/* Right Column */}
-              <View style={styles.rightColumn}>
-                <View style={styles.timerCard}>
-                  <Text style={styles.cardLabel}>{t.timerTitle}</Text>
-                  <View style={styles.timerContainer}>
-                    <Text style={[styles.timerValue, isAlarm && {color: THEME.danger}]}>{timeDisplay.m}</Text>
-                    <Text style={[styles.timerColon, isAlarm && {color: THEME.danger}]}>:</Text>
-                    <Text style={[styles.timerValue, isAlarm && {color: THEME.danger}]}>{timeDisplay.s}</Text>
-                  </View>
-                  <Text style={[styles.timerStatus, isAlarm && {color: THEME.danger}]}>
-                    {isAlarm ? t.alarm : t.sitting}
-                  </Text>
-                </View>
-
-                <View style={styles.metricsCard}>
-                  <Text style={[styles.cardLabel, {marginBottom: 10}]}>{t.targetLabel}</Text>
-                  <View style={styles.metricsGrid}>
-                    {Object.keys(settings.targets).map((key) => (
-                        <View key={key} style={styles.metricItem}>
-                          <ProgressBar
-                              label={t.parts[key as BodyPartSlug]}
-                              current={muscleProgress[key]||0}
-                              target={settings.targets[key as BodyPartSlug]}
-                          />
-                        </View>
-                    ))}
-                  </View>
-                </View>
-              </View>
-            </View>
-
-            {/* Mission Card */}
-            <View style={[styles.missionCard, isAlarm && styles.missionCardAlarm]}>
-              <View style={[styles.decorLine, isAlarm && { backgroundColor: THEME.danger }]} />
-              <View style={styles.missionHeader}>
-                <View style={[styles.tag, isAlarm ? styles.tagDanger : styles.tagPrimary]}>
-                  <Text style={[styles.tagText, isAlarm && { color: '#000' }]}>{isAlarm ? t.missionAlarm : t.missionNext}</Text>
-                </View>
-                <Text style={styles.missionProgress}>
-                  {t.progress}: {muscleProgress[currentMission?.targetSlug] || 0} / {settings.targets[currentMission?.targetSlug] || 3}
-                </Text>
-              </View>
-
-              {/* [UI升级] 字体再次加大 */}
-              <Text style={styles.missionTitle}>
-                {lang === 'zh' ? currentMission?.title : currentMission?.titleEn}
+          {!!selectedRecoveryGuide && (
+            <View style={[styles.recoveryCard, { borderColor: theme.border, backgroundColor: theme.surfaceAlt }]}> 
+              <CartoonActionPanel
+                part="sedentary"
+                frames={buildGuideFrames(selectedRecoveryGuide, 'sedentary')}
+                colors={panelColors}
+                compact
+              />
+              <Text style={[styles.recoveryTitle, { color: theme.text }]}>{selectedRecoveryGuide.title}</Text>
+              <Text style={[styles.recoveryMeta, { color: theme.primary }]}> 
+                {selectedRecoveryGuide.goal} · {selectedRecoveryGuide.duration}
               </Text>
-              <Text style={styles.missionDesc}>
-                {lang === 'zh' ? currentMission?.desc : currentMission?.descEn}
-              </Text>
-
-              <View style={styles.tipBox}>
-                <Text style={styles.tipLabel}>{t.tips.tip}:</Text>
-                <Text style={styles.missionTip}>
-                  {lang === 'zh' ? currentMission?.tip : currentMission?.tipEn}
-                </Text>
-              </View>
+              <Text style={[styles.recoveryTip, { color: theme.textDim }]}>{selectedRecoveryGuide.cue}</Text>
               <TouchableOpacity
-                  style={[styles.actionBtn, isAlarm && styles.actionBtnAlarm]}
-                  onPress={handleCompleteMission}
-                  activeOpacity={0.8}
-              >
-                <Text style={[styles.actionBtnText, isAlarm && { color: THEME.danger }]}>
-                  {isAlarm ? t.missionStop : t.missionDone}
-                </Text>
+                style={[styles.singleBtnSmall, { borderColor: theme.border, backgroundColor: theme.surface }]}
+                onPress={() => speakText(buildGuideVoiceText(selectedRecoveryGuide, lang))}>
+                <Text style={[styles.smallBtnText, { color: theme.text }]}>语音讲解</Text>
               </TouchableOpacity>
             </View>
+          )}
 
-          </ScrollView>
+          <View style={styles.rowBtnWrap}>
+            <TouchableOpacity style={[styles.rowBtn, { borderColor: theme.danger, backgroundColor: theme.alarmBg }]} onPress={previewSedentary}>
+              <Text style={[styles.rowBtnText, { color: theme.danger }]}>预览久坐提醒</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.rowBtn, { borderColor: theme.primary, backgroundColor: theme.chipBg }]} onPress={completeSedentary}>
+              <Text style={[styles.rowBtnText, { color: theme.primary }]}>我已起立完成</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      );
+    }
 
-          {/* Settings Modal */}
-          <Modal visible={showSettings} transparent animationType="fade">
-            <View style={styles.modalOverlay}>
-              <View style={styles.modalContent}>
-                <Text style={styles.modalTitle}>{t.modalTitle}</Text>
-                <Text style={styles.inputLabel}>{t.limitLabel}</Text>
-                <TextInput style={styles.input} value={formLimit} onChangeText={setFormLimit} keyboardType="numeric" />
-                <Text style={styles.groupTitle}>{t.targetLabel}</Text>
-                <View style={styles.grid}>
-                  {Object.keys(formTargets).map(key => (
-                      <View key={key} style={styles.gridItem}>
-                        <Text style={styles.inputLabel}>{t.parts[key as BodyPartSlug]}</Text>
-                        <TextInput style={styles.inputSmall} value={formTargets[key]} onChangeText={txt => setFormTargets({...formTargets, [key]: txt})} keyboardType="numeric" />
-                      </View>
-                  ))}
-                </View>
-                <View style={styles.modalBtns}>
-                  <TouchableOpacity style={styles.btnCancel} onPress={()=>setShowSettings(false)}><Text style={{color: THEME.textDim, fontWeight: 'bold'}}>{t.btnCancel}</Text></TouchableOpacity>
-                  <TouchableOpacity style={styles.btnSave} onPress={handleSaveSettings}><Text style={{color: '#000', fontWeight:'bold'}}>{t.btnSave}</Text></TouchableOpacity>
-                </View>
-              </View>
+    if (sectionId === 'partReminder') {
+      return (
+        <View style={[styles.card, { backgroundColor: theme.surface, borderColor: theme.border }]}> 
+          <Text style={[styles.cardTitle, { color: theme.text }]}>部位提醒（按目标动态）</Text>
+          <Text style={[styles.noteText, { color: theme.textDim }]}>当前：{isInWorkWindow() ? '工作时段内，自动提醒开启' : '非工作时段，自动提醒暂停'}</Text>
+
+          {!!nextRecommended && (
+            <View style={[styles.nextCard, { borderColor: theme.border, backgroundColor: theme.surfaceAlt }]}> 
+              <Text style={[styles.nextTitle, { color: theme.text }]}>下一优先部位：{PART_META[nextRecommended.slug].label}</Text>
+              <Text style={[styles.nextDesc, { color: theme.textDim }]}>剩余 {nextRecommended.remain} 次，当前完成 {nextRecommended.done}/{nextRecommended.target}</Text>
             </View>
-          </Modal>
+          )}
 
-          {/* Muscle Modal */}
-          <Modal visible={showMuscleModal} transparent animationType="slide" onRequestClose={()=>setShowMuscleModal(false)}>
-            <View style={styles.bottomSheetOverlay}>
-              <View style={styles.bottomSheetContent}>
-                <View style={styles.sheetHeader}>
-                  <View>
-                    <Text style={styles.sheetTitle}>{t.muscleModal.title}</Text>
-                    <Text style={styles.sheetSub}>{selectedMuscle?.name.toUpperCase()}</Text>
-                  </View>
-                  <View style={styles.sheetStat}>
-                    <Text style={styles.sheetStatLabel}>{t.muscleModal.count}</Text>
-                    {/* 弹窗里也显示大类总进度，逻辑闭环 */}
-                    <Text style={[styles.sheetStatValue, (muscleProgress[MUSCLE_MAP[selectedMuscle?.slug || ''] || ''] || 0) >= (settings.targets[MUSCLE_MAP[selectedMuscle?.slug || ''] as BodyPartSlug]||5) ? {color: THEME.completed} : {color: THEME.primary}]}>
-                      {muscleProgress[MUSCLE_MAP[selectedMuscle?.slug || ''] || ''] || 0}
-                    </Text>
-                  </View>
-                </View>
-                <View style={styles.sheetDivider}/>
-                <Text style={styles.sheetSectionTitle}>{t.muscleModal.actions}</Text>
-                <FlatList
-                    data={selectedMuscleExercises}
-                    keyExtractor={item => item.id}
-                    style={{maxHeight: 300}}
-                    ListEmptyComponent={<Text style={styles.emptyText}>{t.muscleModal.empty}</Text>}
-                    renderItem={({item}) => (
-                        <TouchableOpacity style={styles.exerciseRow} onPress={() => handleQuickComplete(item)}>
-                          <View style={{flex: 1}}>
-                            <Text style={styles.exTitle}>{lang === 'zh' ? item.title : item.titleEn}</Text>
-                            <Text style={styles.exDesc} numberOfLines={1}>{lang === 'zh' ? item.tip : item.tipEn}</Text>
-                          </View>
-                          <View style={styles.playIcon}>
-                            <Text style={{color: THEME.primary, fontSize: 10, fontWeight: 'bold'}}>DO IT</Text>
-                          </View>
-                        </TouchableOpacity>
-                    )}
-                />
-                <TouchableOpacity style={styles.closeSheetBtn} onPress={()=>setShowMuscleModal(false)}>
-                  <Text style={styles.closeSheetText}>{t.btnCancel}</Text>
+          {!!partNudge && (
+            <View style={[styles.nudgeCard, { borderColor: theme.border, backgroundColor: theme.surfaceAlt }]}> 
+              <Text style={[styles.nudgeTitle, { color: theme.primary }]}>机会型提醒 · {PART_META[partNudge.slug].label}</Text>
+              <Text style={[styles.nudgeText, { color: theme.textDim }]}>{partNudge.reason}</Text>
+              <View style={styles.nudgeBtnRow}>
+                <TouchableOpacity style={[styles.nudgeBtn, { borderColor: theme.primary, backgroundColor: theme.chipBg }]} onPress={remindPartNow}>
+                  <Text style={[styles.nudgeBtnText, { color: theme.primary }]}>现在做 1 次</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={[styles.nudgeBtn, { borderColor: theme.border, backgroundColor: theme.surface }]} onPress={snoozePartReminder}>
+                  <Text style={[styles.nudgeBtnText, { color: theme.textDim }]}>稍后 10 分钟</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={[styles.nudgeBtn, { borderColor: theme.border, backgroundColor: theme.surface }]} onPress={mutePartReminderToday}>
+                  <Text style={[styles.nudgeBtnText, { color: theme.textDim }]}>今天先不提醒</Text>
                 </TouchableOpacity>
               </View>
             </View>
-          </Modal>
+          )}
 
-        </SafeAreaView>
-      </Animated.View>
+          <TouchableOpacity style={[styles.singleBtn, { borderColor: theme.primary, backgroundColor: theme.chipBg }]} onPress={previewPartReminder}>
+            <Text style={[styles.rowBtnText, { color: theme.primary }]}>预览部位提醒</Text>
+          </TouchableOpacity>
+        </View>
+      );
+    }
+
+    if (sectionId === 'summary') {
+      return (
+        <View style={styles.summaryRow}>
+          <View style={[styles.summaryCard, { backgroundColor: theme.surface, borderColor: theme.border }]}> 
+            <Text style={[styles.summaryLabel, { color: theme.textDim }]}>久坐中断</Text>
+            <Text style={[styles.summaryValue, { color: theme.primary }]}>{todayActivity.sedentaryBreaks || 0}</Text>
+          </View>
+          <View style={[styles.summaryCard, { backgroundColor: theme.surface, borderColor: theme.border }]}> 
+            <Text style={[styles.summaryLabel, { color: theme.textDim }]}>起立总次数</Text>
+            <Text style={[styles.summaryValue, { color: theme.primary }]}>{todayActivity.standCount || 0}</Text>
+          </View>
+          <View style={[styles.summaryCard, { backgroundColor: theme.surface, borderColor: theme.border }]}> 
+            <Text style={[styles.summaryLabel, { color: theme.textDim }]}>累计久坐(分)</Text>
+            <Text style={[styles.summaryValue, { color: theme.primary }]}>{totalSitMinToday}</Text>
+          </View>
+        </View>
+      );
+    }
+
+    if (sectionId === 'bodyOverview') {
+      return (
+        <View style={[styles.card, { backgroundColor: theme.surface, borderColor: theme.border }]}> 
+          <View style={styles.cardTitleRow}>
+            <Text style={[styles.cardTitle, { color: theme.text }]}>体态与进度总览（横向）</Text>
+            <TouchableOpacity style={[styles.singleBtnSmall, { borderColor: theme.border, backgroundColor: theme.chipBg }]} onPress={() => setBodySide((p) => (p === 'front' ? 'back' : 'front'))}>
+              <Text style={[styles.smallBtnText, { color: theme.textDim }]}>{bodySide === 'front' ? '切到背面' : '切到正面'}</Text>
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.overviewRow}>
+            <View style={[styles.overviewPane, { borderColor: theme.border, backgroundColor: theme.surfaceAlt }]}> 
+              <Text style={[styles.overviewTitle, { color: theme.text }]}>人体图</Text>
+              <View style={styles.bodyWrap}>
+                <Body
+                  data={highlights}
+                  side={bodySide}
+                  scale={0.9}
+                  border={theme.border}
+                  colors={[theme.primary, theme.success]}
+                  onBodyPartPress={onBodyPress}
+                />
+              </View>
+              <View style={styles.legendRow}>
+                <View style={styles.legendItem}>
+                  <View style={[styles.legendDot, { backgroundColor: theme.success }]} />
+                  <Text style={[styles.legendText, { color: theme.textDim }]}>完成</Text>
+                </View>
+                <View style={styles.legendItem}>
+                  <View style={[styles.legendDot, { backgroundColor: theme.primary }]} />
+                  <Text style={[styles.legendText, { color: theme.textDim }]}>部分</Text>
+                </View>
+                <View style={styles.legendItem}>
+                  <View style={[styles.legendDot, { backgroundColor: theme.border }]} />
+                  <Text style={[styles.legendText, { color: theme.textDim }]}>未开始</Text>
+                </View>
+              </View>
+            </View>
+
+            <View style={[styles.overviewPane, { borderColor: theme.border, backgroundColor: theme.surfaceAlt }]}> 
+              <Text style={[styles.overviewTitle, { color: theme.text }]}>环形进度</Text>
+              {partProgress.map((item) => {
+                const color = item.status === 'done' ? theme.success : item.status === 'partial' ? theme.primary : theme.textDim;
+                return (
+                  <TouchableOpacity
+                    key={item.slug}
+                    style={[styles.ringRowItem, { borderColor: theme.border, backgroundColor: theme.surface }]}
+                    onPress={() => {
+                      setSelectedPart(item.slug);
+                      setShowGuideModal(true);
+                    }}>
+                    <ProgressRing progress={Math.min(item.ratio, 1)} size={42} stroke={5} color={color} track={theme.border} />
+                    <View style={styles.ringInfo}>
+                      <Text style={[styles.ringName, { color: theme.text }]}>{PART_META[item.slug].label}</Text>
+                      <Text style={[styles.ringDetail, { color: color }]}>完成 {item.done}/{item.target}</Text>
+                    </View>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          </ScrollView>
+        </View>
+      );
+    }
+
+    if (sectionId === 'quickActions') {
+      return (
+        <View style={[styles.card, { backgroundColor: theme.surface, borderColor: theme.border }]}> 
+          <Text style={[styles.cardTitle, { color: theme.text }]}>设置入口</Text>
+          <Text style={[styles.noteText, { color: theme.textDim }]}>支持按星期灵活设置久坐阈值与部位目标。</Text>
+          <TouchableOpacity
+            style={[styles.singleBtn, { borderColor: theme.primary, backgroundColor: theme.chipBg }]}
+            onPress={() => router.push('/(tabs)/settings')}>
+            <Text style={[styles.rowBtnText, { color: theme.primary }]}>进入设置页</Text>
+          </TouchableOpacity>
+        </View>
+      );
+    }
+
+    return (
+      <View style={[styles.card, { backgroundColor: theme.surface, borderColor: theme.border }]}> 
+        <Text style={[styles.cardTitle, { color: theme.text }]}>工作状态分析（模拟）</Text>
+        <Text style={[styles.noteText, { color: theme.textDim }]}>当前阶段：{workspaceInsight.segment}</Text>
+        {workspaceInsight.issues.map((item, idx) => (
+          <Text key={`issue-${idx}`} style={[styles.analysisIssue, { color: theme.warning }]}>• {item}</Text>
+        ))}
+        {workspaceInsight.suggestions.map((item, idx) => (
+          <Text key={`action-${idx}`} style={[styles.analysisAction, { color: theme.text }]}>
+            - {item}
+          </Text>
+        ))}
+      </View>
+    );
+  };
+
+  return (
+    <SafeAreaView style={[styles.container, { backgroundColor: theme.bg }]}> 
+      <ScrollView contentContainerStyle={[styles.scrollContent, isWide && styles.scrollContentWide]}>
+        <View style={styles.headerRow}>
+          <View>
+            <Text style={[styles.pageTitle, { color: theme.text }]}>智能久坐与部位提醒</Text>
+            <Text style={[styles.pageSubTitle, { color: theme.textDim }]}>今日方案：{DAY_LABEL[todayKey]} · 久坐阈值 {effectivePlan.limitMin} 分钟</Text>
+          </View>
+          <Pressable style={[styles.switchBtn, { borderColor: theme.border, backgroundColor: theme.surface }]} onPress={toggleThemeMode}>
+            <Text style={[styles.switchBtnText, { color: theme.text }]}>{themeMode === 'dark' ? '深色' : '浅色'}</Text>
+          </Pressable>
+        </View>
+
+        {orderedSectionIds.map((sectionId) => (
+          <React.Fragment key={sectionId}>{renderSectionById(sectionId)}</React.Fragment>
+        ))}
+      </ScrollView>
+
+      <Modal transparent visible={showSedentaryModal} animationType="fade" onRequestClose={() => setShowSedentaryModal(false)}>
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, { backgroundColor: theme.surface, borderColor: theme.danger }]}> 
+            <Text style={[styles.modalTitle, { color: theme.danger }]}>久坐强提醒</Text>
+            <Text style={[styles.modalText, { color: theme.text }]}>你已达到今日久坐阈值，请立刻起身活动 30-60 秒。</Text>
+
+            {!!selectedRecoveryGuide && (
+              <View style={[styles.exerciseBox, { borderColor: theme.border, backgroundColor: theme.surfaceAlt }]}> 
+                <CartoonActionPanel
+                  part="sedentary"
+                  frames={buildGuideFrames(selectedRecoveryGuide, 'sedentary')}
+                  colors={panelColors}
+                />
+                <Text style={[styles.exerciseTitle, { color: theme.text }]}>{selectedRecoveryGuide.title}</Text>
+                <Text style={[styles.exerciseDesc, { color: theme.textDim }]}> 
+                  {selectedRecoveryGuide.goal} · {selectedRecoveryGuide.duration}
+                </Text>
+                {selectedRecoveryGuide.steps.map((step, idx) => (
+                  <Text key={`${selectedRecoveryGuide.id}-${idx}`} style={[styles.stepText, { color: theme.textDim }]}>
+                    {idx + 1}. {step}
+                  </Text>
+                ))}
+                <Text style={[styles.exerciseTip, { color: theme.primary }]}>{selectedRecoveryGuide.cue}</Text>
+                <TouchableOpacity
+                  style={[styles.singleBtnSmall, { borderColor: theme.border, backgroundColor: theme.surface }]}
+                  onPress={() => speakText(buildGuideVoiceText(selectedRecoveryGuide, lang))}>
+                  <Text style={[styles.smallBtnText, { color: theme.text }]}>语音讲解</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+
+            <View style={styles.modalBtnRow}>
+              <TouchableOpacity style={[styles.modalBtn, { borderColor: theme.border, backgroundColor: theme.surfaceAlt }]} onPress={() => setShowSedentaryModal(false)}>
+                <Text style={[styles.modalBtnText, { color: theme.textDim }]}>稍后处理</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.modalBtn, { borderColor: theme.primary, backgroundColor: theme.chipBg }]} onPress={completeSedentary}>
+                <Text style={[styles.modalBtnText, { color: theme.primary }]}>我已起立完成</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal transparent visible={showPartReminderModal} animationType="fade" onRequestClose={() => setShowPartReminderModal(false)}>
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, { backgroundColor: theme.surface, borderColor: theme.primary }]}> 
+            <Text style={[styles.modalTitle, { color: theme.primary }]}>部位训练提醒</Text>
+            <Text style={[styles.modalText, { color: theme.text }]}>当前优先建议：{selectedPart ? PART_META[selectedPart].label : '-'}</Text>
+
+            {!!selectedExercise && (
+              <View style={[styles.exerciseBox, { borderColor: theme.border, backgroundColor: theme.surfaceAlt }]}> 
+                <CartoonActionPanel
+                  part={getExerciseVisualPart(selectedExercise)}
+                  frames={buildExerciseFrames(selectedExercise)}
+                  colors={panelColors}
+                />
+                <Text style={[styles.exerciseTitle, { color: theme.text }]}>{selectedExercise.title}</Text>
+                <Text style={[styles.exerciseDesc, { color: theme.textDim }]}>{selectedExercise.desc}</Text>
+                <Text style={[styles.exerciseTip, { color: theme.primary }]}>{selectedExercise.tip}</Text>
+                <TouchableOpacity
+                  style={[styles.singleBtnSmall, { borderColor: theme.border, backgroundColor: theme.surface }]}
+                  onPress={() => speakText(buildExerciseVoiceText(selectedExercise, lang))}>
+                  <Text style={[styles.smallBtnText, { color: theme.text }]}>语音讲解</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+
+            {!!selectedPart && (
+              <View style={[styles.exerciseBox, { borderColor: theme.border, backgroundColor: theme.surfaceAlt }]}> 
+                <Text style={[styles.exerciseTitle, { color: theme.text }]}>该部位重点动作</Text>
+                {(PART_TRAINING_GUIDES[selectedPart] || []).slice(0, 2).map((guide) => (
+                  <View key={guide.id} style={styles.inlineGuideItem}>
+                    <Text style={[styles.inlineGuideTitle, { color: theme.text }]}>{guide.title}</Text>
+                    <Text style={[styles.inlineGuideMeta, { color: theme.textDim }]}>
+                      {guide.goal} · {guide.duration}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            )}
+
+            <View style={styles.modalBtnRow}>
+              <TouchableOpacity style={[styles.modalBtn, { borderColor: theme.border, backgroundColor: theme.surfaceAlt }]} onPress={() => setShowPartReminderModal(false)}>
+                <Text style={[styles.modalBtnText, { color: theme.textDim }]}>忽略本次</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.modalBtn, { borderColor: theme.primary, backgroundColor: theme.chipBg }]} onPress={completePart}>
+                <Text style={[styles.modalBtnText, { color: theme.primary }]}>完成该动作 +1</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal transparent visible={showGuideModal} animationType="slide" onRequestClose={() => setShowGuideModal(false)}>
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCardLarge, { backgroundColor: theme.surface, borderColor: theme.border }]}> 
+            <Text style={[styles.modalTitle, { color: theme.text }]}>动作讲解：{selectedPart ? PART_META[selectedPart].label : '-'}</Text>
+            <ScrollView style={{ maxHeight: 340 }}>
+              {(selectedPart ? PART_TRAINING_GUIDES[selectedPart] || [] : []).map((guide) => (
+                <View key={guide.id} style={[styles.guideItem, { borderColor: theme.border, backgroundColor: theme.surfaceAlt }]}> 
+                  <CartoonActionPanel
+                    part={selectedPart ? getExerciseVisualPart({ targetSlug: selectedPart }) : getGuideVisualPart(guide)}
+                    frames={buildGuideFrames(guide, selectedPart ? getExerciseVisualPart({ targetSlug: selectedPart }) : undefined)}
+                    colors={panelColors}
+                  />
+                  <Text style={[styles.exerciseTitle, { color: theme.text }]}>{guide.title}</Text>
+                  <Text style={[styles.exerciseDesc, { color: theme.textDim }]}>{guide.goal} · {guide.duration}</Text>
+                  {guide.steps.map((step, idx) => (
+                    <Text key={`${guide.id}-${idx}`} style={[styles.stepText, { color: theme.textDim }]}>
+                      {idx + 1}. {step}
+                    </Text>
+                  ))}
+                  <Text style={[styles.exerciseTip, { color: theme.primary }]}>{guide.cue}</Text>
+                  <TouchableOpacity
+                    style={[styles.singleBtnSmall, { borderColor: theme.border, backgroundColor: theme.surface }]}
+                    onPress={() => speakText(buildGuideVoiceText(guide, lang))}>
+                    <Text style={[styles.smallBtnText, { color: theme.text }]}>语音讲解</Text>
+                  </TouchableOpacity>
+                </View>
+              ))}
+
+              {selectedExercises.map((item) => (
+                <View key={item.id} style={[styles.guideItem, { borderColor: theme.border, backgroundColor: theme.surfaceAlt }]}> 
+                  <CartoonActionPanel
+                    part={getExerciseVisualPart(item)}
+                    frames={buildExerciseFrames(item)}
+                    colors={panelColors}
+                  />
+                  <Text style={[styles.exerciseTitle, { color: theme.text }]}>{item.title}</Text>
+                  <Text style={[styles.exerciseDesc, { color: theme.textDim }]}>{item.desc}</Text>
+                  <Text style={[styles.exerciseTip, { color: theme.primary }]}>{item.tip}</Text>
+                  <TouchableOpacity
+                    style={[styles.singleBtnSmall, { borderColor: theme.border, backgroundColor: theme.surface }]}
+                    onPress={() => speakText(buildExerciseVoiceText(item, lang))}>
+                    <Text style={[styles.smallBtnText, { color: theme.text }]}>语音讲解</Text>
+                  </TouchableOpacity>
+                </View>
+              ))}
+
+              {!selectedExercises.length && <Text style={[styles.emptyText, { color: theme.textDim }]}>该部位暂未配置动作。</Text>}
+            </ScrollView>
+            <View style={styles.modalBtnRow}>
+              <TouchableOpacity style={[styles.modalBtn, { borderColor: theme.primary, backgroundColor: theme.chipBg }]} onPress={() => setShowGuideModal(false)}>
+                <Text style={[styles.modalBtnText, { color: theme.primary }]}>关闭</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: THEME.bg },
-  header: { paddingHorizontal: 24, paddingTop: 20, paddingBottom: 10, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  brand: { color: THEME.primary, fontSize: 18, fontWeight: '900', letterSpacing: 1 },
-  brandSub: { color: THEME.textDim, fontSize: 10, letterSpacing: 2, marginTop: 2 },
-  langBtn: { paddingVertical: 6, paddingHorizontal: 12, backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 4, borderWidth: 1, borderColor: THEME.border },
-  settingBtn: { paddingVertical: 6, paddingHorizontal: 12, backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 4, borderWidth: 1, borderColor: THEME.border },
-  btnTextSmall: { color: THEME.primary, fontSize: 10, fontWeight: 'bold' },
-  scrollContent: { padding: 20 },
+  container: { flex: 1 },
+  scrollContent: { paddingHorizontal: 16, paddingBottom: 30, gap: 12 },
+  scrollContentWide: { maxWidth: 1160, width: '100%', alignSelf: 'center' },
+  headerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingTop: 10 },
+  pageTitle: { fontSize: 22, fontWeight: '800' },
+  pageSubTitle: { marginTop: 4, fontSize: 12 },
+  switchBtn: { borderWidth: 1, borderRadius: 999, paddingHorizontal: 12, paddingVertical: 8 },
+  switchBtnText: { fontSize: 12, fontWeight: '700' },
 
-  dashboardRow: { flexDirection: 'row', height: 400, marginBottom: 20, gap: 12 },
+  card: { borderWidth: 1, borderRadius: 16, padding: 14, gap: 10 },
+  gradientCard: {
+    boxShadow: '0px 4px 10px rgba(0,212,255,0.12)',
+  },
+  cardTitleRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  cardTitle: { fontSize: 16, fontWeight: '800' },
+  priorityText: { fontSize: 11, fontWeight: '800' },
+  noteText: { fontSize: 12 },
 
-  heatmapCard: { flex: 1.5, backgroundColor: THEME.cardBg, borderRadius: 16, padding: 12, borderWidth: 1, borderColor: THEME.border, overflow: 'hidden' },
-  heatmapWrapper: { flex: 1, justifyContent: 'center', alignItems: 'center', marginTop: -20 },
-  legendContainer: { flexDirection: 'row', justifyContent: 'center', gap: 12, marginTop: -10 },
-  cardLabel: { color: THEME.textDim, fontSize: 10, fontWeight: 'bold', letterSpacing: 1 },
-  cardHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', width: '100%', marginBottom: 10, zIndex: 10 },
-  rotateBtn: { padding: 4, borderWidth: 1, borderColor: THEME.textDim, borderRadius: 4 },
-  rotateText: { color: THEME.textDim, fontSize: 9, fontWeight: 'bold' },
-  hintText: { color: THEME.textDim, fontSize: 9, textAlign: 'center', marginTop: 5, fontStyle: 'italic' },
+  timerCard: { borderWidth: 1, borderRadius: 12, paddingVertical: 12, paddingHorizontal: 14 },
+  cardLabel: { fontSize: 12, fontWeight: '600' },
+  timerContainer: { marginTop: 6, flexDirection: 'row', alignItems: 'center', justifyContent: 'center' },
+  timerValue: { fontSize: 42, fontWeight: '900' },
+  timerColon: { fontSize: 34, fontWeight: '700', marginHorizontal: 6 },
+  timerStatus: { marginTop: 6, textAlign: 'center', fontSize: 12, fontWeight: '600' },
 
-  rightColumn: { flex: 1, gap: 12 },
-  timerCard: { flex: 0.8, backgroundColor: THEME.cardBg, borderRadius: 16, padding: 16, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: THEME.border },
-  timerContainer: { flexDirection: 'row', alignItems: 'baseline', marginTop: 5 },
-  timerValue: { fontSize: 36, fontWeight: 'bold', color: THEME.primary, fontVariant: ['tabular-nums'] },
-  timerColon: { fontSize: 32, fontWeight: 'bold', color: THEME.textDim, marginHorizontal: 2 },
-  timerStatus: { fontSize: 9, color: THEME.textDim, marginTop: 4, letterSpacing: 1 },
-  metricsCard: { flex: 1.2, backgroundColor: THEME.cardBg, borderRadius: 16, padding: 16, borderWidth: 1, borderColor: THEME.border },
-  metricsGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', rowGap: 12 },
-  metricItem: { width: '48%' },
-  progressRow: { gap: 4 },
-  progressLabelBox: { flexDirection: 'row', justifyContent: 'space-between' },
-  progressLabel: { color: THEME.textDim, fontSize: 9 },
-  progressValue: { color: THEME.text, fontSize: 9, fontWeight: 'bold' },
-  track: { height: 4, backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 2, overflow: 'hidden' },
-  fill: { height: '100%', borderRadius: 2 },
+  recoveryCard: { borderWidth: 1, borderRadius: 12, padding: 10, gap: 4 },
+  recoveryTitle: { fontSize: 14, fontWeight: '800' },
+  recoveryMeta: { fontSize: 12, fontWeight: '700' },
+  recoveryTip: { fontSize: 12 },
 
-  missionCard: { backgroundColor: THEME.cardBg, borderRadius: 16, padding: 20, borderWidth: 1, borderColor: THEME.border, overflow: 'hidden', minHeight: 220 },
-  missionCardAlarm: { borderColor: THEME.danger, backgroundColor: '#1f0a0a' },
-  decorLine: { position: 'absolute', top: 0, left: 0, right: 0, height: 2, backgroundColor: THEME.primary },
-  missionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
-  tag: { paddingVertical: 4, paddingHorizontal: 8, borderRadius: 4 },
-  tagPrimary: { backgroundColor: THEME.primaryDim },
-  tagDanger: { backgroundColor: THEME.danger },
-  tagText: { color: THEME.primary, fontSize: 10, fontWeight: 'bold' },
-  missionProgress: { color: THEME.textDim, fontSize: 10 },
+  nextCard: { borderWidth: 1, borderRadius: 12, padding: 10, gap: 2 },
+  nextTitle: { fontSize: 13, fontWeight: '700' },
+  nextDesc: { fontSize: 12 },
+  nudgeCard: { borderWidth: 1, borderRadius: 12, padding: 10, gap: 8 },
+  nudgeTitle: { fontSize: 13, fontWeight: '800' },
+  nudgeText: { fontSize: 12, lineHeight: 18 },
+  nudgeBtnRow: { flexDirection: 'row', gap: 8, flexWrap: 'wrap' },
+  nudgeBtn: { borderWidth: 1, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 7 },
+  nudgeBtnText: { fontSize: 11, fontWeight: '700' },
 
-  // [字体再次优化]
-  missionTitle: { color: '#fff', fontSize: 28, fontWeight: 'bold', marginBottom: 12, lineHeight: 32 },
-  missionDesc: { color: '#d0dbe6', fontSize: 17, lineHeight: 26, marginBottom: 20 },
+  rowBtnWrap: { flexDirection: 'row', gap: 10 },
+  rowBtn: { flex: 1, borderWidth: 1, borderRadius: 10, paddingVertical: 10, alignItems: 'center' },
+  rowBtnText: { fontWeight: '700', fontSize: 13 },
+  singleBtn: { borderWidth: 1, borderRadius: 10, paddingVertical: 10, alignItems: 'center' },
+  singleBtnSmall: { borderWidth: 1, borderRadius: 999, paddingHorizontal: 10, paddingVertical: 6 },
+  smallBtnText: { fontSize: 11, fontWeight: '700' },
 
-  tipBox: { flexDirection: 'row', backgroundColor: 'rgba(255,255,255,0.03)', padding: 14, borderRadius: 8, marginBottom: 24, gap: 8 },
-  tipLabel: { color: THEME.primary, fontSize: 12, fontWeight: 'bold' },
-  missionTip: { color: THEME.textDim, fontSize: 12, fontStyle: 'italic', flex: 1, lineHeight: 18 },
+  summaryRow: { flexDirection: 'row', gap: 8 },
+  summaryCard: { flex: 1, borderWidth: 1, borderRadius: 12, paddingVertical: 10, paddingHorizontal: 10 },
+  summaryLabel: { fontSize: 11, marginBottom: 6 },
+  summaryValue: { fontSize: 20, fontWeight: '800' },
 
-  actionBtn: { backgroundColor: THEME.primary, paddingVertical: 18, borderRadius: 8, alignItems: 'center' },
-  actionBtnAlarm: { backgroundColor: '#fff' },
-  actionBtnText: { color: '#000', fontWeight: '900', fontSize: 18, letterSpacing: 1 },
+  overviewRow: { gap: 10, paddingBottom: 2 },
+  overviewPane: {
+    width: 300,
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 10,
+    gap: 8,
+  },
+  overviewTitle: { fontSize: 14, fontWeight: '800' },
+  bodyWrap: { alignItems: 'center', justifyContent: 'center' },
+  legendRow: { flexDirection: 'row', gap: 12 },
+  legendItem: { flexDirection: 'row', alignItems: 'center', gap: 5 },
+  legendDot: { width: 8, height: 8, borderRadius: 999 },
+  legendText: { fontSize: 11 },
 
-  // Shared Modal (Styles unchanged)
-  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.9)', justifyContent: 'center', padding: 24 },
-  modalContent: { backgroundColor: '#0f1926', borderRadius: 16, padding: 24, borderWidth: 1, borderColor: THEME.border },
-  modalTitle: { color: '#fff', fontSize: 16, fontWeight: 'bold', marginBottom: 20, textAlign: 'center' },
-  inputLabel: { color: THEME.primary, fontSize: 10, marginBottom: 5, fontWeight: 'bold' },
-  input: { backgroundColor: '#050a10', color: '#fff', padding: 10, borderRadius: 6, marginBottom: 15, borderWidth: 1, borderColor: THEME.border },
-  groupTitle: { color: '#fff', fontSize: 12, fontWeight: 'bold', marginTop: 10, marginBottom: 10, borderBottomWidth: 1, borderBottomColor: THEME.border, paddingBottom: 5 },
-  grid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between' },
-  gridItem: { width: '48%', marginBottom: 12 },
-  inputSmall: { backgroundColor: '#050a10', color: '#fff', padding: 10, borderRadius: 6, borderWidth: 1, borderColor: THEME.border, textAlign: 'center', fontWeight: 'bold' },
-  modalBtns: { flexDirection: 'row', marginTop: 20, gap: 12 },
-  btnCancel: { flex: 1, padding: 12, backgroundColor: '#050a10', borderRadius: 6, alignItems: 'center', borderWidth: 1, borderColor: THEME.border },
-  btnSave: { flex: 1, padding: 12, backgroundColor: THEME.primary, borderRadius: 6, alignItems: 'center' },
+  ringRowItem: {
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 8,
+  },
+  ringInfo: { flex: 1 },
+  ringName: { fontSize: 13, fontWeight: '700' },
+  ringDetail: { fontSize: 12, marginTop: 2, fontWeight: '700' },
 
-  // Bottom Sheet Modal
-  bottomSheetOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.8)', justifyContent: 'flex-end' },
-  bottomSheetContent: { backgroundColor: '#0f1926', borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: 24, borderWidth: 1, borderColor: THEME.border, minHeight: 400 },
-  sheetHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 },
-  sheetTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
-  sheetSub: { color: THEME.primary, fontSize: 12, fontWeight: 'bold', letterSpacing: 1 },
-  sheetStat: { alignItems: 'flex-end' },
-  sheetStatLabel: { color: THEME.textDim, fontSize: 10 },
-  sheetStatValue: { color: THEME.primary, fontSize: 24, fontWeight: 'bold' },
-  sheetDivider: { height: 1, backgroundColor: THEME.border, marginBottom: 20 },
-  sheetSectionTitle: { color: THEME.textDim, fontSize: 10, marginBottom: 10, fontWeight: 'bold' },
-  exerciseRow: { flexDirection: 'row', backgroundColor: 'rgba(255,255,255,0.03)', padding: 16, borderRadius: 8, marginBottom: 10, alignItems: 'center', justifyContent: 'space-between' },
-  exTitle: { color: '#fff', fontSize: 14, fontWeight: 'bold', marginBottom: 4 },
-  exDesc: { color: THEME.textDim, fontSize: 11 },
-  playIcon: { paddingVertical: 6, paddingHorizontal: 10, backgroundColor: 'rgba(0, 243, 255, 0.1)', borderRadius: 4, borderWidth: 1, borderColor: THEME.primary },
-  emptyText: { color: THEME.textDim, textAlign: 'center', marginTop: 20, fontStyle: 'italic' },
-  closeSheetBtn: { marginTop: 20, padding: 16, backgroundColor: '#050a10', borderRadius: 8, alignItems: 'center', borderWidth: 1, borderColor: THEME.border },
-  closeSheetText: { color: THEME.textDim, fontWeight: 'bold' }
+  analysisIssue: { fontSize: 12, lineHeight: 18 },
+  analysisAction: { fontSize: 12, lineHeight: 18 },
+
+  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.55)', justifyContent: 'center', paddingHorizontal: 18 },
+  modalCard: { borderWidth: 1, borderRadius: 14, padding: 16, gap: 10 },
+  modalCardLarge: { borderWidth: 1, borderRadius: 14, padding: 16, gap: 10, maxHeight: '82%' },
+  modalTitle: { fontSize: 18, fontWeight: '800' },
+  modalText: { fontSize: 14, lineHeight: 20 },
+  modalBtnRow: { flexDirection: 'row', gap: 10, marginTop: 6 },
+  modalBtn: { flex: 1, borderWidth: 1, borderRadius: 10, paddingVertical: 10, alignItems: 'center' },
+  modalBtnText: { fontWeight: '700' },
+
+  exerciseBox: { borderWidth: 1, borderRadius: 10, padding: 10, gap: 6 },
+  exerciseTitle: { fontSize: 14, fontWeight: '700' },
+  exerciseDesc: { fontSize: 12, lineHeight: 18 },
+  exerciseTip: { fontSize: 12, fontWeight: '700' },
+  stepText: { fontSize: 12, lineHeight: 18 },
+
+  inlineGuideItem: { marginTop: 6 },
+  inlineGuideTitle: { fontSize: 13, fontWeight: '700' },
+  inlineGuideMeta: { fontSize: 12 },
+
+  guideItem: { borderWidth: 1, borderRadius: 10, padding: 10, marginBottom: 8 },
+  emptyText: { textAlign: 'center', marginVertical: 20 },
 });

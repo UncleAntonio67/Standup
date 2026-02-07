@@ -16,6 +16,22 @@ This is an [Expo](https://expo.dev) project created with [`create-expo-app`](htt
    npx expo start
    ```
 
+## Current Features
+
+- 用户注册/登录（本地账号体系）
+- 按用户隔离的个人训练与提醒数据
+- 首页模块可自定义排序（设置页长按拖拽）
+- 动作图文+语音提示（动作库与提醒弹窗）
+- 移动端与 PC 端响应式排版优化
+
+## Build APK
+
+```bash
+eas build -p android --profile preview
+```
+
+详细步骤见：`docs/apk-build.md`
+
 In the output, you'll find options to open the app in a
 
 - [development build](https://docs.expo.dev/develop/development-builds/introduction/)
